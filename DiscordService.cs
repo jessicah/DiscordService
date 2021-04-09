@@ -3,14 +3,11 @@ using Discord.Rest;
 using Discord.WebSocket;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Dynamic;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
-using System.Xml.Schema;
 
 namespace DiscordService
 {
@@ -27,12 +24,19 @@ namespace DiscordService
 		public List<ulong> Members { get; set; }
 	}
 
+	internal static class CacheKeys
+	{
+		public static string AllChannels { get => "_Channels"; }
+		public static string Channel(string name) => $"_Channel:{name.ToLower().Replace(' ', '-')}";
+	}
+
 	// provides a singleton interface to Discord API with caching of data, to
 	// avoid hitting the Discord API excessively
 	public class DiscordService
 	{
 		private IMemoryCache _memoryCache;
 		private IConfiguration _config;
+		private ILogger _logger;
 
 		private ulong _guildId;
 
@@ -51,24 +55,29 @@ namespace DiscordService
 				await _discordClient.LoginAsync(TokenType.Bot, _config["Discord:BotToken"]);
 				await _discordClient.StartAsync();
 
+				if (ulong.TryParse(_config["Discord:GuildId"], out _guildId) == false)
+				{
+					throw new ArgumentNullException("GuildId");
+				}
+
 				_guild = await _discordClient.Rest.GetGuildAsync(_guildId);
 			}
 
 			return _discordClient;
 		}
 
-		public DiscordService(IMemoryCache memoryCache, IConfiguration config, ulong guildId)
+		public DiscordService(IMemoryCache memoryCache, IConfiguration config, ILogger<DiscordService> logger)
 		{
 			_memoryCache = memoryCache;
 			_config = config;
-			_guildId = guildId;
+			_logger = logger;
 		}
 
 		public async Task<IInviteMetadata> GetTemporaryInviteAsync()
 		{
 			var client = Client();
 
-			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>("_Channels", out var channels))
+			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, out var channels))
 			{
 				channels = await _guild.GetTextChannelsAsync();
 			}
@@ -82,20 +91,28 @@ namespace DiscordService
 
 		public async Task<ChannelDetails> GetChannelAsync(string name)
 		{
-			var cacheKeyName = name.ToLower().Replace(' ', '-');
+			var cacheKeyName = CacheKeys.Channel(name);
 
-			if (!_memoryCache.TryGetValue<ChannelDetails>($"_Channel:{cacheKeyName}", out var channelDetails))
+			if (!_memoryCache.TryGetValue<ChannelDetails>(cacheKeyName, out var channelDetails))
 			{
 				var channels = await GetChannelsAsync();
 
 				foreach (var channel in channels)
 				{
-					if (channel.Name.ToLower().Replace(' ', '-') == cacheKeyName)
+					if (CacheKeys.Channel(channel.Name) == cacheKeyName)
 					{
+						_logger.LogInformation("Retrieved channel {0}", name);
+
 						return channel;
 					}
 				}
+
+				_logger.LogInformation("Unable to locate channel {0}", name);
+
+				return null;
 			}
+
+			_logger.LogInformation("Retrieved channel {0} from cache", name);
 
 			return channelDetails;
 		}
@@ -104,11 +121,13 @@ namespace DiscordService
 		{
 			var client = Client();
 
-			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>("_Channels", out var allChannels))
+			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, out var allChannels))
 			{
 				allChannels = await _guild.GetChannelsAsync();
 
-				_memoryCache.Set<IEnumerable<RestGuildChannel>>("_Channels", allChannels);
+				_logger.LogInformation("Unable to fetch all channels from cache");
+
+				_memoryCache.Set<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, allChannels, TimeSpan.FromMinutes(10));
 			}
 
 			var parentChannelNames = new string[] { "A", "B", "C", "D" }
@@ -131,7 +150,7 @@ namespace DiscordService
 
 			foreach (var channel in nestedChannels)
 			{
-				string nameLookup = channel.Name.ToLower().Replace(' ', '-');
+				string nameLookup = CacheKeys.Channel(channel.Name);
 
 				if (!channels.TryGetValue(nameLookup, out var channelDetail))
 				{
@@ -186,7 +205,7 @@ namespace DiscordService
 
 			foreach (var channelDetail in channels)
 			{
-				_memoryCache.Set<ChannelDetails>($"_Channel:{channelDetail.Key}", channelDetail.Value);
+				_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(channelDetail.Key), channelDetail.Value, TimeSpan.FromMinutes(10));
 			}
 
 			return channels.Values.ToList();
@@ -200,9 +219,7 @@ namespace DiscordService
 				throw new ArgumentNullException(nameof(channel.Members));
 			}
 
-			var cacheKeyName = channel.Name.ToLower().Replace(' ', '-');
-
-			if (_memoryCache.TryGetValue<ChannelDetails>($"_Channel:{cacheKeyName}", out var existingChannel))
+			if (_memoryCache.TryGetValue<ChannelDetails>(CacheKeys.Channel(channel.Name), out var existingChannel))
 			{
 				throw new ArgumentException("Channel already exists");
 			}
@@ -222,11 +239,11 @@ namespace DiscordService
 			var textCategory = categories.SingleOrDefault(channel => channel.Name == $"{categoryName} Text");
 			var voiceCategory = categories.SingleOrDefault(channel => channel.Name == $"{categoryName} Voice");
 
-			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>("_Channels", out var allChannels))
+			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, out var allChannels))
 			{
 				allChannels = await _guild.GetChannelsAsync();
 
-				_memoryCache.Set<IEnumerable<RestGuildChannel>>("_Channels", allChannels);
+				_memoryCache.Set<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, allChannels);
 			}
 
 			IEnumerable<INestedChannel> nestedChannels = allChannels.Select(row => row as INestedChannel)
@@ -260,7 +277,7 @@ namespace DiscordService
 			}
 
 			var textChannelName = channel.Name.ToLower().Replace(' ', '-');
-			if (channel.Text && nestedChannels.Any(row => row.CategoryId == textCategory.Id && row.Name == textChannelName) == false)
+			if (channel.Text && nestedChannels.Any(row => row.CategoryId == textCategory.Id && row.Name.ToLower() == textChannelName) == false)
 			{
 				var textChannel = await _guild.CreateTextChannelAsync(textChannelName, props =>
 				{
@@ -290,7 +307,12 @@ namespace DiscordService
 			// sort our channels
 			await _guild.ReorderChannelsAsync(reorderedChannels);
 
-			_memoryCache.Set<ChannelDetails>($"_Channel:{cacheKeyName}", channel);
+			_logger.LogInformation("Created channel {0}, invalidating all channels list as well", channel.Name);
+
+			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(channel.Name), channel, TimeSpan.FromMinutes(10));
+
+			// invalid our list of channels
+			_memoryCache.Remove(CacheKeys.AllChannels);
 
 			return channel.Members.Except(discordUsers.Where(row => row != null).Select(row => row.Id));
 		}
@@ -301,8 +323,6 @@ namespace DiscordService
 			{
 				throw new ArgumentNullException(nameof(channel.Members));
 			}
-
-			var cacheKeyName = channel.Name.ToLower().Replace(' ', '-');
 
 			var client = Client();
 
@@ -319,6 +339,8 @@ namespace DiscordService
 			var removedMembers = await Task
 				.WhenAll<RestGuildUser>(existingChannel.Members.Where(snowflake => channel.Members.Contains(snowflake) == false)
 					.Select(snowflake => _guild.GetUserAsync(snowflake)));
+
+			existingChannel.Members = channel.Members;
 
 			if (existingChannel.VoiceId.HasValue)
 			{
@@ -365,6 +387,10 @@ namespace DiscordService
 					await textChannel.RemovePermissionOverwriteAsync(removed);
 				}
 			}
+
+			_logger.LogInformation("Updated channel membership for {0}", existingChannel.Name);
+
+			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(existingChannel.Name), existingChannel, TimeSpan.FromMinutes(10));
 		}
 	}
 }
