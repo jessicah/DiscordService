@@ -4,9 +4,12 @@ using Discord.WebSocket;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DiscordService
@@ -28,11 +31,12 @@ namespace DiscordService
 	{
 		public static string AllChannels { get => "_Channels"; }
 		public static string Channel(string name) => $"_Channel:{name.ToLower().Replace(' ', '-')}";
+		public static string Eviction { get => "_EvictionSource"; }
 	}
 
 	// provides a singleton interface to Discord API with caching of data, to
 	// avoid hitting the Discord API excessively
-	public class DiscordService
+	public class DiscordApiService
 	{
 		private IMemoryCache _memoryCache;
 		private IConfiguration _config;
@@ -66,7 +70,7 @@ namespace DiscordService
 			return _discordClient;
 		}
 
-		public DiscordService(IMemoryCache memoryCache, IConfiguration config, ILogger<DiscordService> logger)
+		public DiscordApiService(IMemoryCache memoryCache, IConfiguration config, ILogger<DiscordApiService> logger)
 		{
 			_memoryCache = memoryCache;
 			_config = config;
@@ -75,7 +79,7 @@ namespace DiscordService
 
 		public async Task<IInviteMetadata> GetTemporaryInviteAsync()
 		{
-			var client = Client();
+			var client = await Client();
 
 			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, out var channels))
 			{
@@ -87,6 +91,35 @@ namespace DiscordService
 			var invite = await general.CreateInviteAsync(maxAge: (int)TimeSpan.FromDays(2).TotalSeconds, maxUses: 3, isTemporary: true, isUnique: true);
 
 			return invite;
+		}
+
+		private CancellationChangeToken EvictionChangeSource
+		{
+			get
+			{
+				if (!_memoryCache.TryGetValue<CancellationTokenSource>(CacheKeys.Eviction, out var tokenSource))
+				{
+					tokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+
+					_memoryCache.Set(CacheKeys.Eviction, tokenSource, new MemoryCacheEntryOptions
+					{
+						Priority = CacheItemPriority.NeverRemove
+					});
+				}
+
+				return new CancellationChangeToken(tokenSource.Token);
+			}
+		}
+
+		public void ClearCache()
+		{
+			if (_memoryCache.TryGetValue<CancellationTokenSource>(CacheKeys.Eviction, out var tokenSource))
+			{
+				tokenSource.Cancel();
+
+				// the token has been canceled, so we'll need to generate a new one when required later
+				_memoryCache.Remove(CacheKeys.Eviction);
+			}
 		}
 
 		public async Task<ChannelDetails> GetChannelAsync(string name)
@@ -119,7 +152,7 @@ namespace DiscordService
 
 		public async Task<IEnumerable<ChannelDetails>> GetChannelsAsync()
 		{
-			var client = Client();
+			var client = await Client();
 
 			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, out var allChannels))
 			{
@@ -127,7 +160,7 @@ namespace DiscordService
 
 				_logger.LogInformation("Unable to fetch all channels from cache");
 
-				_memoryCache.Set<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, allChannels, TimeSpan.FromMinutes(10));
+				_memoryCache.Set<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, allChannels, EvictionChangeSource);
 			}
 
 			var parentChannelNames = new string[] { "A", "B", "C", "D" }
@@ -203,10 +236,24 @@ namespace DiscordService
 				}
 			}
 
+			StringBuilder builder = new StringBuilder();
+
 			foreach (var channelDetail in channels)
 			{
-				_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(channelDetail.Key), channelDetail.Value, TimeSpan.FromMinutes(10));
+				_memoryCache.GetOrCreate(channelDetail.Key, entry =>
+				{
+					entry.AddExpirationToken(EvictionChangeSource);
+
+					return channelDetail.Value;
+				});
+
+				builder.AppendLine($"Channel: {channelDetail.Value.Name}");
+				builder.AppendLine($"  VoiceId: {channelDetail.Value.VoiceId}");
+				builder.AppendLine($"  TextId: {channelDetail.Value.TextId}");
+				builder.AppendLine($"  Members: {channelDetail.Value.Members.Count}");
 			}
+
+			_logger.LogInformation(builder.ToString());
 
 			return channels.Values.ToList();
 		}
@@ -224,7 +271,7 @@ namespace DiscordService
 				throw new ArgumentException("Channel already exists");
 			}
 
-			var client = Client();
+			var client = await Client();
 
 			var denyChannelPermission = new OverwritePermissions(viewChannel: PermValue.Deny);
 			var allowChannelPermission = new OverwritePermissions(viewChannel: PermValue.Allow);
@@ -243,7 +290,7 @@ namespace DiscordService
 			{
 				allChannels = await _guild.GetChannelsAsync();
 
-				_memoryCache.Set<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, allChannels);
+				_memoryCache.Set<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, allChannels, EvictionChangeSource);
 			}
 
 			IEnumerable<INestedChannel> nestedChannels = allChannels.Select(row => row as INestedChannel)
@@ -309,7 +356,7 @@ namespace DiscordService
 
 			_logger.LogInformation("Created channel {0}, invalidating all channels list as well", channel.Name);
 
-			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(channel.Name), channel, TimeSpan.FromMinutes(10));
+			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(channel.Name), channel, EvictionChangeSource);
 
 			// invalid our list of channels
 			_memoryCache.Remove(CacheKeys.AllChannels);
@@ -324,7 +371,7 @@ namespace DiscordService
 				throw new ArgumentNullException(nameof(channel.Members));
 			}
 
-			var client = Client();
+			var client = await Client();
 
 			var existingChannel = await GetChannelAsync(channel.Name);
 
@@ -390,7 +437,8 @@ namespace DiscordService
 
 			_logger.LogInformation("Updated channel membership for {0}", existingChannel.Name);
 
-			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(existingChannel.Name), existingChannel, TimeSpan.FromMinutes(10));
+			_memoryCache.Remove(CacheKeys.Channel(existingChannel.Name));
+			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(existingChannel.Name), existingChannel, EvictionChangeSource);
 		}
 	}
 }
