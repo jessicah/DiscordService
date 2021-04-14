@@ -88,7 +88,7 @@ namespace DiscordService
 
 			var general = channels.First(row => row.Name == "general") as RestTextChannel;
 
-			var invite = await general.CreateInviteAsync(maxAge: (int)TimeSpan.FromDays(2).TotalSeconds, maxUses: 3, isTemporary: true, isUnique: true);
+			var invite = await general.CreateInviteAsync(maxAge: (int)TimeSpan.FromDays(1).TotalSeconds, maxUses: 3, isTemporary: true, isUnique: true);
 
 			return invite;
 		}
