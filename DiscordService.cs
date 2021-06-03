@@ -77,6 +77,22 @@ namespace DiscordService
 			_logger = logger;
 		}
 
+		public async Task<IInviteMetadata> GetInitialInvite()
+		{
+			var client = await Client();
+
+			if (!_memoryCache.TryGetValue<IEnumerable<RestGuildChannel>>(CacheKeys.AllChannels, out var channels))
+			{
+				channels = await _guild.GetTextChannelsAsync();
+			}
+
+			var general = channels.First(row => row.Name == "general") as RestTextChannel;
+
+			var invite = await general.CreateInviteAsync(maxAge: (int)TimeSpan.FromDays(1).TotalSeconds, maxUses: 1, isTemporary: false, isUnique: true);
+
+			return invite;
+		}
+
 		public async Task<IInviteMetadata> GetTemporaryInviteAsync()
 		{
 			var client = await Client();
@@ -439,6 +455,54 @@ namespace DiscordService
 
 			_memoryCache.Remove(CacheKeys.Channel(existingChannel.Name));
 			_memoryCache.Set<ChannelDetails>(CacheKeys.Channel(existingChannel.Name), existingChannel, EvictionChangeSource);
+		}
+
+		public async Task DeleteMember(long snowflake, string reason)
+		{
+			await Client();
+
+			var user = await _guild.GetUserAsync((ulong)snowflake);
+
+			await user.KickAsync(reason);
+		}
+
+		public async Task DeleteMembers(IEnumerable<long> snowflakes, string reason)
+		{
+			await Client();
+
+			var tasks = new List<Task>();
+
+			foreach (var snowflake in snowflakes)
+			{
+				var user = await _guild.GetUserAsync((ulong)snowflake);
+
+				tasks.Add(user.KickAsync(reason));
+			}
+
+			Task.WaitAll(tasks.ToArray());
+		}
+
+		public async Task<IEnumerable<ulong>> GetMembers()
+		{
+			await Client();
+
+			var snowflakes = new List<ulong>();
+
+			await foreach (var users in _guild.GetUsersAsync())
+			{
+				snowflakes.AddRange(users.Select(user => user.Id));
+			}
+
+			return snowflakes;
+		}
+
+		public async Task SendMessage(ulong channelId, string message)
+		{
+			var client = await Client();
+
+			var textChannel = client.GetGuild(_guildId).GetTextChannel(channelId);
+
+			await textChannel.SendMessageAsync(text: message);
 		}
 	}
 }
