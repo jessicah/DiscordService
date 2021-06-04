@@ -52,6 +52,23 @@ namespace DiscordService
 			if (_discordClient == null)
 			{
 				_discordClient = new DiscordSocketClient();
+
+				// set up a notification for new members joining the server
+				_discordClient.UserJoined += (user) =>
+				{
+					if (string.IsNullOrWhiteSpace(user.Nickname))
+						return SendMessage(849774281105866762, $"{user.Username} has joined Discord, but is not connected yet");
+
+					return SendMessage(849774281105866762, $"{user.Nickname} ({user.Username}) has joined Discord, and is connected");
+				};
+
+				_discordClient.GuildMemberUpdated += (userBefore, userAfter) =>
+				{
+					if (string.IsNullOrWhiteSpace(userBefore.Nickname) && string.IsNullOrWhiteSpace(userAfter.Nickname) == false)
+						return SendMessage(849774281105866762, $"{userAfter.Nickname} ({userAfter.Username}) has been fully connected");
+
+					return Task.CompletedTask;
+				};
 			}
 
 			if (_discordClient.ConnectionState != ConnectionState.Connected)
