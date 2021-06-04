@@ -3,6 +3,7 @@ using Discord.Rest;
 using Discord.WebSocket;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 using System;
@@ -36,7 +37,7 @@ namespace DiscordService
 
 	// provides a singleton interface to Discord API with caching of data, to
 	// avoid hitting the Discord API excessively
-	public class DiscordApiService
+	public class DiscordApiService : IHostedService
 	{
 		private IMemoryCache _memoryCache;
 		private IConfiguration _config;
@@ -52,6 +53,21 @@ namespace DiscordService
 			if (_discordClient == null)
 			{
 				_discordClient = new DiscordSocketClient();
+
+				
+			}
+
+			if (_discordClient.ConnectionState != ConnectionState.Connected)
+			{
+				await _discordClient.LoginAsync(TokenType.Bot, _config["Discord:BotToken"]);
+				await _discordClient.StartAsync();
+
+				if (ulong.TryParse(_config["Discord:GuildId"], out _guildId) == false)
+				{
+					throw new ArgumentNullException("GuildId");
+				}
+
+				_guild = await _discordClient.Rest.GetGuildAsync(_guildId);
 
 				// set up a notification for new members joining the server
 				_discordClient.UserJoined += (user) =>
@@ -69,19 +85,6 @@ namespace DiscordService
 
 					return Task.CompletedTask;
 				};
-			}
-
-			if (_discordClient.ConnectionState != ConnectionState.Connected)
-			{
-				await _discordClient.LoginAsync(TokenType.Bot, _config["Discord:BotToken"]);
-				await _discordClient.StartAsync();
-
-				if (ulong.TryParse(_config["Discord:GuildId"], out _guildId) == false)
-				{
-					throw new ArgumentNullException("GuildId");
-				}
-
-				_guild = await _discordClient.Rest.GetGuildAsync(_guildId);
 			}
 
 			return _discordClient;
@@ -520,6 +523,16 @@ namespace DiscordService
 			var textChannel = client.GetGuild(_guildId).GetTextChannel(channelId);
 
 			await textChannel.SendMessageAsync(text: message);
+		}
+
+		public Task StartAsync(CancellationToken cancellationToken)
+		{
+			return Client();
+		}
+
+		public Task StopAsync(CancellationToken cancellationToken)
+		{
+			return Task.CompletedTask;
 		}
 	}
 }
